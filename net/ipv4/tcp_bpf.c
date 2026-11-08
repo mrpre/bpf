@@ -602,8 +602,19 @@ static int tcp_bpf_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	if (unlikely(!psock))
 		return tcp_sendmsg(sk, msg, size);
 
-	lock_sock(sk);
 	timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+	/*
+	 * The verdict, apply_bytes, sk_redir and the cork live in the psock
+	 * and span the places where the socket lock is dropped below. They
+	 * can only serve one sender at a time.
+	 */
+	err = mutex_lock_interruptible(&psock->tx_mutex);
+	if (err) {
+		sk_psock_put(sk, psock);
+		return sock_intr_errno(timeo);
+	}
+
+	lock_sock(sk);
 	while (msg_data_left(msg)) {
 		bool enospc = false;
 		u32 copy, osize;
@@ -677,6 +688,7 @@ out_err:
 	if (err < 0)
 		err = sk_stream_error(sk, msg->msg_flags, err);
 	release_sock(sk);
+	mutex_unlock(&psock->tx_mutex);
 	sk_psock_put(sk, psock);
 	return copied > 0 ? copied : err;
 }

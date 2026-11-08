@@ -801,6 +801,7 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
 
 	INIT_DELAYED_WORK(&psock->work, sk_psock_backlog);
 	mutex_init(&psock->work_mutex);
+	mutex_init(&psock->tx_mutex);
 	INIT_LIST_HEAD(&psock->ingress_msg);
 	spin_lock_init(&psock->ingress_lock);
 	skb_queue_head_init(&psock->ingress_skb);
@@ -889,6 +890,7 @@ static void sk_psock_destroy(struct work_struct *work)
 	cancel_delayed_work_sync(&psock->work);
 	__sk_psock_zap_ingress(psock);
 	mutex_destroy(&psock->work_mutex);
+	mutex_destroy(&psock->tx_mutex);
 
 	psock_progs_drop(&psock->progs);
 
