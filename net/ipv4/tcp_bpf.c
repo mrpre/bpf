@@ -30,6 +30,21 @@ void tcp_eat_skb(struct sock *sk, struct sk_buff *skb)
 	__tcp_cleanup_rbuf(sk, skb->len);
 }
 
+/*
+ * A child that nobody has accepted yet is freed by the listener under
+ * bh_lock_sock(), which doesn't expect an owner.
+ */
+static bool bpf_tcp_ingress_lock(struct sock *sk)
+	__acquires(&sk->sk_lock.slock)
+{
+	if (!READ_ONCE(sk->sk_socket))
+		return lock_sock_fast(sk);
+
+	lock_sock(sk);
+	__acquire(&sk->sk_lock.slock);
+	return true;
+}
+
 static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 			   struct sk_msg *msg, u32 apply_bytes)
 {
@@ -38,6 +53,7 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 	u32 size, copied = 0;
 	struct sk_msg *tmp;
 	int i, ret = 0;
+	bool slow;
 
 	if (!msg->sg.size)
 		return 0;
@@ -46,7 +62,7 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 	if (unlikely(!tmp))
 		return -ENOMEM;
 
-	lock_sock(sk);
+	slow = bpf_tcp_ingress_lock(sk);
 	tmp->sg.start = msg->sg.start;
 	i = msg->sg.start;
 	do {
@@ -87,7 +103,7 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 		kfree(tmp);
 	}
 
-	release_sock(sk);
+	unlock_sock_fast(sk, slow);
 	return ret;
 }
 
@@ -188,9 +204,17 @@ static int tcp_bpf_push_locked(struct sock *sk, struct sk_msg *msg,
 int tcp_bpf_sendmsg_redir(struct sock *sk, bool ingress,
 			  struct sk_msg *msg, u32 bytes, int flags)
 {
-	struct sk_psock *psock = sk_psock_get(sk);
+	struct sk_psock *psock;
 	int ret;
 
+	/*
+	 * The listener frees a child that nobody has accepted yet without
+	 * waiting for the owner of its socket lock. Ingress doesn't own it.
+	 */
+	if (!ingress && !READ_ONCE(sk->sk_socket))
+		return sock_flag(sk, SOCK_DEAD) ? -EPIPE : -EINVAL;
+
+	psock = sk_psock_get(sk);
 	if (unlikely(!psock))
 		return -EPIPE;
 
