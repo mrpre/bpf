@@ -1,0 +1,283 @@
+name: AI Code Review (on @claude comment)
+
+# Fork-local variant of ai-code-review.yml: a "@claude" comment on a PR reviews
+# every commit of the PR's series. It runs on GitHub-hosted runners and
+# authenticates with the repository's CLAUDE_CODE_OAUTH_TOKEN secret.
+#
+# issue_comment workflows run from the default branch: this file and ci/claude
+# must be there, whatever branch the PR targets.
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ai-review-comment-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  get-commits:
+    # The review runs with the repository's Claude token on the PR's code:
+    # only people with write access may start it.
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    outputs:
+      commits: ${{ steps.get-commits.outputs.commits }}
+      has-commits: ${{ steps.get-commits.outputs.has-commits }}
+      base-sha: ${{ steps.get-commits.outputs.base-sha }}
+      head-sha: ${{ steps.get-commits.outputs.head-sha }}
+      head-repo: ${{ steps.get-commits.outputs.head-repo }}
+    steps:
+      - name: Acknowledge the comment
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes
+
+      # Trigger a review job for each separate commit of the series.
+      # As a safeguard, check no more than the first 100 commits.
+      - name: Get PR commits
+        id: get-commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}
+        run: |
+          gh api "$PR" > pr.json
+          commits=$(gh api --paginate "$PR/commits" --jq '.[].sha' | head -n 100 | jq -R -s -c 'split("\n")[:-1]')
+          {
+            echo "base-sha=$(jq -r .base.sha pr.json)"
+            echo "head-sha=$(jq -r .head.sha pr.json)"
+            echo "head-repo=$(jq -r .head.repo.clone_url pr.json)"
+            echo "commits=$commits"
+            echo "has-commits=$([ "$commits" != "[]" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+
+  ai-review:
+    needs: get-commits
+    if: needs.get-commits.outputs.has-commits == 'true'
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    # The image provides semcode, its database and a linux mirror.
+    container:
+      image: ghcr.io/kernel-patches/runner:ai-review
+    strategy:
+      matrix:
+        commit: ${{ fromJson(needs.get-commits.outputs.commits) }}
+      fail-fast: false
+      # All jobs share one Claude account's rate limits.
+      max-parallel: 3
+    env:
+      BASE_SHA: ${{ needs.get-commits.outputs.base-sha }}
+      HEAD_SHA: ${{ needs.get-commits.outputs.head-sha }}
+      SHA: ${{ matrix.commit }}
+    steps:
+      - name: Checkout CI code
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github
+            ci
+
+      - name: Set up .claude/settings.json
+        shell: bash
+        run: |
+          mkdir -p ~/.claude
+          cp ci/claude/settings.json ~/.claude/settings.json
+
+      - name: Download Linux source tree
+        uses: libbpf/ci/get-linux-source@v4
+        with:
+          repo: ${{ needs.get-commits.outputs.head-repo }}
+          rev: ${{ needs.get-commits.outputs.head-sha }}
+          dest: .kernel
+        env:
+          REFERENCE_REPO_PATH: /libbpfci/mirrors/linux
+          FETCH_DEPTH: 0
+
+      # Make ${{ github.workspace }} the root of the Linux git repo, keeping
+      # the ci/ checked out above (default branch) over the PR head's own.
+      - name: Move linux source in place
+        shell: bash
+        run: |
+          rm -rf .git .github
+          cd .kernel
+          rm -rf ci
+          mv -t .. $(ls -A)
+          cd ..
+          rmdir .kernel
+
+      - name: semcode-index
+        timeout-minutes: 30
+        shell: bash
+        env:
+          # semcode-index --lore fetches into the lore archive baked into the
+          # image, and gitoxide needs a committer to update the reflog.
+          GIT_COMMITTER_NAME: semcode-index
+          GIT_COMMITTER_EMAIL: semcode-index@localhost
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git fetch --no-tags https://github.com/kernel-patches/bpf.git bpf-next
+          git checkout "$SHA" -b patch-series.local
+          MERGE_BASE=$(git merge-base FETCH_HEAD HEAD)
+          ln -s /ci/.semcode.db ${{ github.workspace }}/.semcode.db
+          semcode-index --git "${MERGE_BASE}..HEAD"
+          semcode-index --lore bpf
+
+      - name: Get patch subject
+        id: get-patch-subject
+        shell: bash
+        run: |
+          subject=$(git log -1 --pretty=format:"%s" "$SHA")
+          echo "subject=$subject" >> $GITHUB_OUTPUT
+
+      - name: Checkout AI review configuration
+        uses: actions/checkout@v6
+        with:
+          repository: 'kernel-patches/bpf-ai-review'
+          path: 'bpf-ai-review'
+          ref: main
+          submodules: true
+
+      - name: Set up AI review
+        id: setup-ai-review
+        shell: bash
+        run: |
+          bpf-ai-review/setup.sh ${{ github.workspace }} "$RUNNER_TEMP/trigger.md"
+          rm -rf bpf-ai-review
+          # setup.sh exports a Bedrock model ID, which the Claude API rejects.
+          echo "ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-5-5" >> "$GITHUB_ENV"
+          {
+            echo 'prompt<<EOF_TRIGGER_PROMPT'
+            cat "$RUNNER_TEMP/trigger.md"
+            echo 'EOF_TRIGGER_PROMPT'
+          } >> "$GITHUB_OUTPUT"
+
+      # The review scripts need them; the runner:ai-review image lacks both.
+      - name: Install python3 and jq
+        continue-on-error: true
+        timeout-minutes: 3
+        shell: bash
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 jq
+
+      # orc.md skips the context agent when review-context/index.json exists.
+      - name: Create review context
+        shell: bash
+        run: |
+          timeout 300 python3 review/scripts/create_changes.py "$SHA" -o review-context || {
+            rm -rf review-context
+            echo "::warning::create_changes.py failed, the context agent will run"
+          }
+
+      - uses: anthropics/claude-code-action@v1
+        timeout-minutes: 65
+        with:
+          show_full_output: true
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --max-turns 100
+            --mcp-config ci/claude/mcp.json
+            --model claude-opus-5-5
+            --effort xhigh
+          prompt: ${{ steps.setup-ai-review.outputs.prompt }}
+
+      # If Claude produced review-inline.txt then it found something
+      # Post a comment on PR and fail the job
+      - name: Check review-inline.txt and review-metadata.json
+        id: check_review
+        shell: bash
+        run: |
+          review_file=$(find ${{ github.workspace }} -name review-inline.txt)
+          if [ -s "$review_file" ]; then
+              cat $review_file || true
+              cp "$review_file" "$RUNNER_TEMP/review-inline.txt"
+              echo "review_file=$RUNNER_TEMP/review-inline.txt" >> $GITHUB_OUTPUT
+          fi
+          review_metadata=$(find ${{ github.workspace }} -name review-metadata.json -print -quit)
+          if [ -s "$review_metadata" ]; then
+              cat $review_metadata || true
+              echo "review_metadata=$review_metadata" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Write a TL;DR of the review
+        if: steps.check_review.outputs.review_file != '' && steps.setup-ai-review.outputs.tldr_prompt != ''
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: anthropics/claude-code-action@v1
+        with:
+          show_full_output: true
+          github_token: ${{ github.token }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --max-turns 5
+            --model claude-sonnet-5-5
+          prompt: ${{ steps.setup-ai-review.outputs.tldr_prompt }}
+
+      - name: Comment on PR
+        if: steps.check_review.outputs.review_file != ''
+        uses: actions/github-script@v8
+        env:
+          REVIEW_FILE: ${{ steps.check_review.outputs.review_file }}
+          REVIEW_METADATA: ${{ steps.check_review.outputs.review_metadata }}
+          PATCH_SUBJECT: ${{ steps.get-patch-subject.outputs.subject }}
+          TLDR_FILE: ${{ github.workspace }}/review-tldr.txt
+        with:
+          script: |
+            const commentScript = require('./ci/claude/post-pr-comment.js');
+            await commentScript({github, context});
+
+      - name: Fail CI job if review file exists
+        if: steps.check_review.outputs.review_file != ''
+        run: |
+          echo "Review file found - failing the CI job"
+          exit 42
+
+      - name: Fail CI job if the review did not complete
+        if: steps.check_review.outputs.review_metadata == ''
+        shell: bash
+        run: |
+          git diff --quiet "$SHA^" "$SHA" && exit 0
+          echo "::error::review-metadata.json not found: the review did not complete"
+          exit 43
+
+      - name: Collect Claude Code session files
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          # Artifacts aren't masked like the job log: drop the credentials that
+          # Claude Code had in its environment.
+          dir="$RUNNER_TEMP/claude-sessions"
+          mkdir -p "$dir"
+          cp -r ~/.claude/projects/. "$dir/" || true
+          for var in CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN; do
+            if [ -n "${!var:-}" ]; then
+              grep -rlF -e "${!var}" "$dir" | xargs -r perl -pi -e "s/\Q\$ENV{$var}\E/***/g" || true
+            fi
+          done
+
+      - name: Upload Claude Code session files
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: claude-sessions-${{ matrix.commit }}
+          path: ${{ runner.temp }}/claude-sessions
+          if-no-files-found: ignore
