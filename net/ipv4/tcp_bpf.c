@@ -30,6 +30,21 @@ void tcp_eat_skb(struct sock *sk, struct sk_buff *skb)
 	__tcp_cleanup_rbuf(sk, skb->len);
 }
 
+/*
+ * A child that nobody has accepted yet is freed by the listener under
+ * bh_lock_sock(), which doesn't expect an owner.
+ */
+static bool bpf_tcp_ingress_lock(struct sock *sk)
+	__acquires(&sk->sk_lock.slock)
+{
+	if (!READ_ONCE(sk->sk_socket))
+		return lock_sock_fast(sk);
+
+	lock_sock(sk);
+	__acquire(&sk->sk_lock.slock);
+	return true;
+}
+
 static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 			   struct sk_msg *msg, u32 apply_bytes)
 {
@@ -38,12 +53,16 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 	u32 size, copied = 0;
 	struct sk_msg *tmp;
 	int i, ret = 0;
+	bool slow;
+
+	if (!msg->sg.size)
+		return 0;
 
 	tmp = kzalloc_obj(*tmp, __GFP_NOWARN | GFP_KERNEL);
 	if (unlikely(!tmp))
 		return -ENOMEM;
 
-	lock_sock(sk);
+	slow = bpf_tcp_ingress_lock(sk);
 	tmp->sg.start = msg->sg.start;
 	i = msg->sg.start;
 	do {
@@ -84,7 +103,7 @@ static int bpf_tcp_ingress(struct sock *sk, struct sk_psock *psock,
 		kfree(tmp);
 	}
 
-	release_sock(sk);
+	unlock_sock_fast(sk, slow);
 	return ret;
 }
 
@@ -185,9 +204,17 @@ static int tcp_bpf_push_locked(struct sock *sk, struct sk_msg *msg,
 int tcp_bpf_sendmsg_redir(struct sock *sk, bool ingress,
 			  struct sk_msg *msg, u32 bytes, int flags)
 {
-	struct sk_psock *psock = sk_psock_get(sk);
+	struct sk_psock *psock;
 	int ret;
 
+	/*
+	 * The listener frees a child that nobody has accepted yet without
+	 * waiting for the owner of its socket lock. Ingress doesn't own it.
+	 */
+	if (!ingress && !READ_ONCE(sk->sk_socket))
+		return sock_flag(sk, SOCK_DEAD) ? -EPIPE : -EINVAL;
+
+	psock = sk_psock_get(sk);
 	if (unlikely(!psock))
 		return -EPIPE;
 
@@ -249,7 +276,6 @@ static int tcp_bpf_recvmsg_parser(struct sock *sk,
 	struct tcp_sock *tcp;
 	int copied_from_self = 0;
 	int copied = 0;
-	u32 seq;
 
 	if (unlikely(flags & MSG_ERRQUEUE))
 		return inet_recv_error(sk, msg, len);
@@ -263,7 +289,6 @@ static int tcp_bpf_recvmsg_parser(struct sock *sk,
 
 	lock_sock(sk);
 	tcp = tcp_sk(sk);
-	seq = tcp->copied_seq;
 	/* We may have received data on the sk_receive_queue pre-accept and
 	 * then we can not use read_skb in this context because we haven't
 	 * assigned a sk_socket yet so have no link to the ops. The work-around
@@ -295,11 +320,10 @@ msg_bytes_ready:
 
 		if (is_fin) {
 			copied = 0;
-			seq++;
+			copied_from_self++;
 			goto out;
 		}
 	}
-	seq += copied_from_self;
 	if (!copied) {
 		long timeo;
 		int data;
@@ -341,7 +365,7 @@ msg_bytes_ready:
 	}
 out:
 	if (!peek)
-		WRITE_ONCE(tcp->copied_seq, seq);
+		WRITE_ONCE(tcp->copied_seq, tcp->copied_seq + copied_from_self);
 	tcp_rcv_space_adjust(sk);
 	/* Data on the psock outlives the connection that it came in on */
 	if (copied > 0 && tcp_can_send_ack(sk))
@@ -441,7 +465,7 @@ static int tcp_bpf_send_verdict(struct sock *sk, struct sk_psock *psock,
 {
 	bool cork = false, enospc = sk_msg_full(msg), redir_ingress;
 	struct sock *sk_redir;
-	u32 tosend, origsize, sent, delta = 0;
+	u32 tosend, origsize, sent, apply, delta = 0;
 	u32 eval;
 	int ret;
 
@@ -510,6 +534,7 @@ more_data:
 		redir_ingress = psock->redir_ingress;
 		sk_redir = psock->sk_redir;
 		sock_hold(sk_redir);
+		apply = psock->apply_bytes;
 		sk_msg_apply_bytes(psock, tosend);
 		if (!psock->apply_bytes) {
 			/* Clean up before releasing the sock lock. */
@@ -531,10 +556,6 @@ more_data:
 		ret = tcp_bpf_sendmsg_redir(sk_redir, redir_ingress,
 					    msg, tosend, flags);
 		sent = origsize - msg->sg.size;
-
-		if (eval == __SK_REDIRECT)
-			sock_put(sk_redir);
-		sock_put(sk_redir);
 
 		lock_sock(sk);
 		sk_mem_uncharge(sk, sent);
@@ -558,6 +579,21 @@ more_data:
 			msg = NULL;
 			ret = 0;
 		}
+		/*
+		 * Bytes that were not sent and come back, in msg or in the
+		 * next sendmsg(), are still covered by the verdict.
+		 */
+		if (apply && sent < tosend && !cork) {
+			psock->apply_bytes += tosend - sent;
+			if (eval == __SK_REDIRECT) {
+				psock->eval = eval;
+				psock->sk_redir = sk_redir;
+				eval = __SK_NONE;
+			}
+		}
+		if (eval == __SK_REDIRECT)
+			sock_put(sk_redir);
+		sock_put(sk_redir);
 		break;
 	case __SK_DROP:
 	default:
@@ -602,8 +638,19 @@ static int tcp_bpf_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	if (unlikely(!psock))
 		return tcp_sendmsg(sk, msg, size);
 
-	lock_sock(sk);
 	timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+	/*
+	 * The verdict, apply_bytes, sk_redir and the cork live in the psock
+	 * and span the places where the socket lock is dropped below. They
+	 * can only serve one sender at a time.
+	 */
+	err = mutex_lock_interruptible(&psock->tx_mutex);
+	if (err) {
+		sk_psock_put(sk, psock);
+		return sock_intr_errno(timeo);
+	}
+
+	lock_sock(sk);
 	while (msg_data_left(msg)) {
 		bool enospc = false;
 		u32 copy, osize;
@@ -677,6 +724,7 @@ out_err:
 	if (err < 0)
 		err = sk_stream_error(sk, msg->msg_flags, err);
 	release_sock(sk);
+	mutex_unlock(&psock->tx_mutex);
 	sk_psock_put(sk, psock);
 	return copied > 0 ? copied : err;
 }
@@ -756,6 +804,7 @@ int tcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
 	struct sk_psock *psock;
 	struct tcp_sock *tp;
 	int copied = 0;
+	u32 seq;
 
 	tp = tcp_sk(sk);
 	rcu_read_lock();
@@ -765,6 +814,7 @@ int tcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
 		goto out;
 	}
 
+	seq = psock->copied_seq;
 	psock->ingress_bytes = 0;
 	copied = tcp_read_sock_noack(sk, desc, recv_actor, true,
 				     &psock->copied_seq);
@@ -775,7 +825,8 @@ int tcp_bpf_strp_read_sock(struct strparser *strp, read_descriptor_t *desc,
 	 * For SK_REDIRECT, we need to ack the frame immediately but for
 	 * SK_PASS, we want to delay the ack until tcp_bpf_recvmsg_parser().
 	 */
-	tp->copied_seq = psock->copied_seq - psock->ingress_bytes;
+	WRITE_ONCE(tp->copied_seq, tp->copied_seq + psock->copied_seq - seq -
+				   psock->ingress_bytes);
 	tcp_rcv_space_adjust(sk);
 	__tcp_cleanup_rbuf(sk, copied - psock->ingress_bytes);
 out:

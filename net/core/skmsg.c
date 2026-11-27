@@ -574,9 +574,6 @@ static int sk_psock_skb_ingress_enqueue(struct sk_buff *skb,
 			return num_sge;
 	}
 
-#if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
-	psock->ingress_bytes += len;
-#endif
 	copied = len;
 	msg->sg.start = 0;
 	msg->sg.size = copied;
@@ -616,8 +613,11 @@ static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb,
 	 */
 	skb_set_owner_r(skb, sk);
 	err = sk_psock_skb_ingress_enqueue(skb, off, len, psock, sk, msg, true);
-	if (err < 0)
+	if (err < 0) {
 		kfree(msg);
+		/* Same as in sk_psock_skb_ingress_self() */
+		skb_orphan(skb);
+	}
 	return err;
 }
 
@@ -642,8 +642,21 @@ static int sk_psock_skb_ingress_self(struct sk_psock *psock, struct sk_buff *skb
 	 */
 	msg->sk = sk;
 	err = sk_psock_skb_ingress_enqueue(skb, off, len, psock, sk, msg, take_ref);
-	if (err < 0)
+	if (err < 0) {
 		kfree(msg);
+		/*
+		 * A strparser skb comes in without an owner and read_sock counts
+		 * it as consumed once it is left to the backlog. Drop the owner
+		 * again, or sk_psock_skb_ingress() takes the skb->sk == sk path
+		 * and recvmsg() counts it a second time.
+		 */
+		if (skb_bpf_strparser(skb))
+			skb_orphan(skb);
+	}
+#if IS_ENABLED(CONFIG_BPF_STREAM_PARSER)
+	else
+		psock->ingress_bytes += len;
+#endif
 	return err;
 }
 
@@ -694,7 +707,7 @@ static void sk_psock_backlog(struct work_struct *work)
 	 * before sk_socket freed. If refcnt increment fails, it indicates
 	 * sock_map_close() completed with sk_socket potentially already freed.
 	 */
-	if (!sk_psock_get(psock->sk))
+	if (!refcount_inc_not_zero(&psock->refcnt))
 		return;
 	mutex_lock(&psock->work_mutex);
 	while ((skb = skb_peek(&psock->ingress_skb))) {
@@ -788,6 +801,7 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
 
 	INIT_DELAYED_WORK(&psock->work, sk_psock_backlog);
 	mutex_init(&psock->work_mutex);
+	mutex_init(&psock->tx_mutex);
 	INIT_LIST_HEAD(&psock->ingress_msg);
 	spin_lock_init(&psock->ingress_lock);
 	skb_queue_head_init(&psock->ingress_skb);
@@ -876,6 +890,7 @@ static void sk_psock_destroy(struct work_struct *work)
 	cancel_delayed_work_sync(&psock->work);
 	__sk_psock_zap_ingress(psock);
 	mutex_destroy(&psock->work_mutex);
+	mutex_destroy(&psock->tx_mutex);
 
 	psock_progs_drop(&psock->progs);
 
@@ -1061,8 +1076,9 @@ static int sk_psock_verdict_apply(struct sk_psock *psock, struct sk_buff *skb,
 	case __SK_DROP:
 	default:
 out_free:
-		skb_bpf_redirect_clear(skb);
+		/* tcp_eat_skb() checks the strparser bit, clear it after */
 		tcp_eat_skb(psock->sk, skb);
+		skb_bpf_redirect_clear(skb);
 		sock_drop(psock->sk, skb);
 	}
 

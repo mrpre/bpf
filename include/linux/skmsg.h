@@ -118,6 +118,7 @@ struct sk_psock {
 				     bool restore);
 	struct proto			*sk_proto;
 	struct mutex			work_mutex;
+	struct mutex			tx_mutex;
 	struct sk_psock_work_state	work_state;
 	struct delayed_work		work;
 	struct sock			*sk_pair;
